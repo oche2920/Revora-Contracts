@@ -7,6 +7,32 @@ Soroban contract for revenue-share offerings and blacklist management.
 *- **Issuer authority:** Only the offering issuer can register offerings, report revenue, set concentration limits, set rounding mode, and report concentration for that offering. The contract does not implement a separate "platform admin" role; all offering-level actions are issuer-authorized.
 - **Issuer transferability:** Issuer control can be securely transferred via a two-step propose/accept flow. The old issuer proposes, the new issuer accepts. Either party can abort before acceptance (old issuer cancels, or new issuer simply doesn't accept). This prevents accidental loss of control and griefing attacks.
 - **Blacklist authority:** Only the current issuer of the offering can add/remove blacklist entries for that offering's token. This ensures issuers have full control over compliance and investor management.
+- **Blacklist/whitelist precedence:** The blacklist unconditionally wins. A blacklisted address is always excluded from payouts regardless of whitelist membership. See [Blacklist/Whitelist Precedence](#blacklistwhitelist-precedence) below.
+
+### Blacklist/Whitelist Precedence
+
+> **Rule: blacklist always wins.** (issue #257)
+
+Eligibility for revenue distribution is determined by this ordered check:
+
+```
+if is_blacklisted(addr)                          → INELIGIBLE (unconditional)
+else if whitelist_enabled && !is_whitelisted(addr) → INELIGIBLE
+else                                               → ELIGIBLE
+```
+
+Key properties:
+
+- **Blacklist check is pre-transfer** — evaluated in `claim()` before any storage write or token transfer.
+- **No whitelist bypass** — adding an address to the whitelist while it is blacklisted has no effect on eligibility.
+- **Idempotent operations** — `blacklist_add` and `blacklist_remove` are safe to call multiple times; duplicate adds are no-ops, duplicate removes do not panic.
+- **Namespace isolation** — blacklist and whitelist are scoped per `(issuer, namespace, token)`; changes in one namespace do not affect another.
+- **Whitelist is optional** — when the whitelist is empty (disabled), all non-blacklisted holders are eligible.
+
+Security assumptions:
+- Only the current issuer or contract admin may add/remove blacklist entries.
+- Blacklist size is capped at `MAX_BLACKLIST_SIZE` (200) to prevent storage DoS.
+- Issuer key compromise could allow blacklist removal; the admin role provides a secondary guard.
 
 ### Public methods
 
