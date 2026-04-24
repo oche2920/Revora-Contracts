@@ -220,3 +220,372 @@ fn test_aggregation_across_namespaces() {
     assert_eq!(metrics.total_reported_revenue, 75000);
     assert_eq!(metrics.offering_count, 2);
 }
+
+// ── Issue #257: Blacklist/whitelist precedence invariants ─────────────────────
+//
+// Security assumption: a blacklisted address is **always** excluded from
+// payouts, regardless of whitelist membership or registration order.
+// The whitelist (when enabled) cannot bypass the blacklist.
+// Both add/remove operations are idempotent.
+
+/// @dev Proves the core invariant: blacklist always wins over whitelist.
+/// An investor on both lists must be treated as ineligible.
+#[test]
+fn test_blacklist_wins_over_whitelist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns = symbol_short!("ns1");
+    let investor = Address::generate(&env);
+
+    client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+
+    // Add investor to whitelist first, then blacklist
+    client.whitelist_add(&issuer, &issuer, &ns, &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &ns, &token, &investor);
+
+    assert!(client.is_blacklisted(&issuer, &ns, &token, &investor));
+    assert!(client.is_whitelisted(&issuer, &ns, &token, &investor));
+
+    // Eligibility check: blacklist must win unconditionally
+    let blacklisted = client.is_blacklisted(&issuer, &ns, &token, &investor);
+    let whitelist_enabled = client.is_whitelist_enabled(&issuer, &ns, &token);
+    let whitelisted = client.is_whitelisted(&issuer, &ns, &token, &investor);
+
+    let eligible = if blacklisted {
+        false
+    } else if whitelist_enabled {
+        whitelisted
+    } else {
+        true
+    };
+
+    assert!(!eligible, "blacklisted investor must not be eligible even when whitelisted");
+}
+
+/// @dev Proves the reverse order: blacklist added before whitelist still wins.
+#[test]
+fn test_blacklist_wins_when_added_before_whitelist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns = symbol_short!("ns1");
+    let investor = Address::generate(&env);
+
+    client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+
+    // Blacklist first, then whitelist
+    client.blacklist_add(&issuer, &issuer, &ns, &token, &investor);
+    client.whitelist_add(&issuer, &issuer, &ns, &token, &investor);
+
+    let blacklisted = client.is_blacklisted(&issuer, &ns, &token, &investor);
+    let whitelist_enabled = client.is_whitelist_enabled(&issuer, &ns, &token);
+    let whitelisted = client.is_whitelisted(&issuer, &ns, &token, &investor);
+
+    let eligible = if blacklisted {
+        false
+    } else if whitelist_enabled {
+        whitelisted
+    } else {
+        true
+    };
+
+    assert!(!eligible, "blacklist added before whitelist must still exclude investor");
+}
+
+/// @dev Removing from blacklist while still on whitelist restores eligibility.
+#[test]
+fn test_remove_from_blacklist_restores_eligibility_when_whitelisted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns = symbol_short!("ns1");
+    let investor = Address::generate(&env);
+
+    client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+
+    client.whitelist_add(&issuer, &issuer, &ns, &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &ns, &token, &investor);
+
+    // Confirm ineligible
+    assert!(client.is_blacklisted(&issuer, &ns, &token, &investor));
+
+    // Remove from blacklist
+    client.blacklist_remove(&issuer, &issuer, &ns, &token, &investor);
+
+    assert!(!client.is_blacklisted(&issuer, &ns, &token, &investor));
+    assert!(client.is_whitelisted(&issuer, &ns, &token, &investor));
+
+    // Now eligible via whitelist
+    let blacklisted = client.is_blacklisted(&issuer, &ns, &token, &investor);
+    let whitelist_enabled = client.is_whitelist_enabled(&issuer, &ns, &token);
+    let whitelisted = client.is_whitelisted(&issuer, &ns, &token, &investor);
+
+    let eligible = if blacklisted {
+        false
+    } else if whitelist_enabled {
+        whitelisted
+    } else {
+        true
+    };
+
+    assert!(eligible, "after blacklist removal, whitelisted investor should be eligible");
+}
+
+/// @dev Whitelist disabled (empty) + not blacklisted = eligible.
+#[test]
+fn test_whitelist_disabled_non_blacklisted_is_eligible() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns = symbol_short!("ns1");
+    let investor = Address::generate(&env);
+
+    client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+
+    // No whitelist entries, no blacklist entries
+    assert!(!client.is_whitelist_enabled(&issuer, &ns, &token));
+    assert!(!client.is_blacklisted(&issuer, &ns, &token, &investor));
+
+    let blacklisted = client.is_blacklisted(&issuer, &ns, &token, &investor);
+    let whitelist_enabled = client.is_whitelist_enabled(&issuer, &ns, &token);
+    let whitelisted = client.is_whitelisted(&issuer, &ns, &token, &investor);
+
+    let eligible = if blacklisted {
+        false
+    } else if whitelist_enabled {
+        whitelisted
+    } else {
+        true
+    };
+
+    assert!(eligible, "non-blacklisted investor with whitelist disabled must be eligible");
+}
+
+/// @dev Whitelist enabled + not on whitelist + not blacklisted = ineligible.
+#[test]
+fn test_whitelist_enabled_excludes_non_whitelisted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns = symbol_short!("ns1");
+    let approved = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+    client.whitelist_add(&issuer, &issuer, &ns, &token, &approved);
+
+    assert!(client.is_whitelist_enabled(&issuer, &ns, &token));
+
+    // stranger is not whitelisted and not blacklisted
+    let blacklisted = client.is_blacklisted(&issuer, &ns, &token, &stranger);
+    let whitelist_enabled = client.is_whitelist_enabled(&issuer, &ns, &token);
+    let whitelisted = client.is_whitelisted(&issuer, &ns, &token, &stranger);
+
+    let eligible = if blacklisted {
+        false
+    } else if whitelist_enabled {
+        whitelisted
+    } else {
+        true
+    };
+
+    assert!(!eligible, "non-whitelisted investor must be excluded when whitelist is enabled");
+}
+
+/// @dev blacklist_add is idempotent: adding the same address twice is safe.
+#[test]
+fn test_blacklist_add_is_idempotent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns = symbol_short!("ns1");
+    let investor = Address::generate(&env);
+
+    client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+
+    client.blacklist_add(&issuer, &issuer, &ns, &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &ns, &token, &investor); // second call must not panic
+
+    assert_eq!(client.get_blacklist(&issuer, &ns, &token).len(), 1);
+    assert!(client.is_blacklisted(&issuer, &ns, &token, &investor));
+}
+
+/// @dev blacklist_remove is idempotent: removing a non-existent address is safe.
+#[test]
+fn test_blacklist_remove_is_idempotent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns = symbol_short!("ns1");
+    let investor = Address::generate(&env);
+
+    client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+
+    // Remove without prior add must not panic
+    client.blacklist_remove(&issuer, &issuer, &ns, &token, &investor);
+    assert!(!client.is_blacklisted(&issuer, &ns, &token, &investor));
+
+    // Add then remove twice
+    client.blacklist_add(&issuer, &issuer, &ns, &token, &investor);
+    client.blacklist_remove(&issuer, &issuer, &ns, &token, &investor);
+    client.blacklist_remove(&issuer, &issuer, &ns, &token, &investor); // second remove must not panic
+
+    assert!(!client.is_blacklisted(&issuer, &ns, &token, &investor));
+    assert_eq!(client.get_blacklist(&issuer, &ns, &token).len(), 0);
+}
+
+/// @dev Mixed sequence: register, set share, whitelist, blacklist, remove from blacklist.
+/// Verifies that state transitions are consistent throughout.
+#[test]
+fn test_mixed_sequence_register_share_whitelist_blacklist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns = symbol_short!("ns1");
+    let investor = Address::generate(&env);
+
+    // Step 1: register offering
+    client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+
+    // Step 2: set holder share
+    client.set_holder_share(&issuer, &ns, &token, &investor, &500);
+    assert_eq!(client.get_holder_share(&issuer, &ns, &token, &investor), 500);
+
+    // Step 3: whitelist investor
+    client.whitelist_add(&issuer, &issuer, &ns, &token, &investor);
+    assert!(client.is_whitelist_enabled(&issuer, &ns, &token));
+    assert!(client.is_whitelisted(&issuer, &ns, &token, &investor));
+
+    // Step 4: blacklist investor — must override whitelist
+    client.blacklist_add(&issuer, &issuer, &ns, &token, &investor);
+    {
+        let bl = client.is_blacklisted(&issuer, &ns, &token, &investor);
+        let wl_on = client.is_whitelist_enabled(&issuer, &ns, &token);
+        let wl = client.is_whitelisted(&issuer, &ns, &token, &investor);
+        let eligible = if bl { false } else if wl_on { wl } else { true };
+        assert!(!eligible, "blacklist must override whitelist after mixed sequence");
+    }
+
+    // Step 5: remove from blacklist — whitelist still active, investor eligible again
+    client.blacklist_remove(&issuer, &issuer, &ns, &token, &investor);
+    {
+        let bl = client.is_blacklisted(&issuer, &ns, &token, &investor);
+        let wl_on = client.is_whitelist_enabled(&issuer, &ns, &token);
+        let wl = client.is_whitelisted(&issuer, &ns, &token, &investor);
+        let eligible = if bl { false } else if wl_on { wl } else { true };
+        assert!(eligible, "after blacklist removal, whitelisted investor should be eligible again");
+    }
+
+    // Step 6: remove from whitelist — whitelist now disabled, investor still eligible (no blacklist)
+    client.whitelist_remove(&issuer, &issuer, &ns, &token, &investor);
+    {
+        let bl = client.is_blacklisted(&issuer, &ns, &token, &investor);
+        let wl_on = client.is_whitelist_enabled(&issuer, &ns, &token);
+        let wl = client.is_whitelisted(&issuer, &ns, &token, &investor);
+        let eligible = if bl { false } else if wl_on { wl } else { true };
+        assert!(eligible, "with whitelist disabled and no blacklist, investor must be eligible");
+    }
+
+    // Share is preserved throughout
+    assert_eq!(client.get_holder_share(&issuer, &ns, &token, &investor), 500);
+}
+
+/// @dev Blacklist/whitelist state is isolated per namespace.
+/// Blacklisting in ns1 must not affect ns2.
+#[test]
+fn test_blacklist_whitelist_namespace_isolation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns1 = symbol_short!("ns1");
+    let ns2 = symbol_short!("ns2");
+    let investor = Address::generate(&env);
+
+    client.register_offering(&issuer, &ns1, &token, &1000, &token, &0);
+    client.register_offering(&issuer, &ns2, &token, &1000, &token, &0);
+
+    // Whitelist in both, blacklist only in ns1
+    client.whitelist_add(&issuer, &issuer, &ns1, &token, &investor);
+    client.whitelist_add(&issuer, &issuer, &ns2, &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &ns1, &token, &investor);
+
+    // ns1: blacklisted → ineligible
+    let bl1 = client.is_blacklisted(&issuer, &ns1, &token, &investor);
+    let wl1 = client.is_whitelisted(&issuer, &ns1, &token, &investor);
+    let wl1_on = client.is_whitelist_enabled(&issuer, &ns1, &token);
+    let eligible1 = if bl1 { false } else if wl1_on { wl1 } else { true };
+    assert!(!eligible1, "investor must be ineligible in ns1 (blacklisted)");
+
+    // ns2: whitelisted, not blacklisted → eligible
+    let bl2 = client.is_blacklisted(&issuer, &ns2, &token, &investor);
+    let wl2 = client.is_whitelisted(&issuer, &ns2, &token, &investor);
+    let wl2_on = client.is_whitelist_enabled(&issuer, &ns2, &token);
+    let eligible2 = if bl2 { false } else if wl2_on { wl2 } else { true };
+    assert!(eligible2, "investor must be eligible in ns2 (whitelisted, not blacklisted)");
+}
+
+/// @dev Multiple investors: some blacklisted, some whitelisted, some both.
+/// Verifies correct eligibility for each category.
+#[test]
+fn test_multi_investor_eligibility_matrix() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let ns = symbol_short!("ns1");
+
+    let only_whitelisted = Address::generate(&env);
+    let only_blacklisted = Address::generate(&env);
+    let both = Address::generate(&env);
+    let neither = Address::generate(&env);
+
+    client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+
+    client.whitelist_add(&issuer, &issuer, &ns, &token, &only_whitelisted);
+    client.whitelist_add(&issuer, &issuer, &ns, &token, &both);
+    client.blacklist_add(&issuer, &issuer, &ns, &token, &only_blacklisted);
+    client.blacklist_add(&issuer, &issuer, &ns, &token, &both);
+
+    let wl_on = client.is_whitelist_enabled(&issuer, &ns, &token);
+
+    let check = |addr: &Address| -> bool {
+        let bl = client.is_blacklisted(&issuer, &ns, &token, addr);
+        let wl = client.is_whitelisted(&issuer, &ns, &token, addr);
+        if bl { false } else if wl_on { wl } else { true }
+    };
+
+    assert!(check(&only_whitelisted), "only_whitelisted must be eligible");
+    assert!(!check(&only_blacklisted), "only_blacklisted must be ineligible");
+    assert!(!check(&both), "on both lists: blacklist wins, must be ineligible");
+    assert!(!check(&neither), "not on whitelist when whitelist enabled: ineligible");
+}
