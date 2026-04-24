@@ -38,6 +38,27 @@ This document outlines the authentication requirements for all externally callab
 | `set_claim_delay` | `issuer` | `current_issuer == issuer` | Issuer sets claim delay. |
 | `set_offering_metadata` | `issuer` | `current_issuer == issuer` | Issuer sets metadata. |
 
+## Blacklist / Whitelist Precedence (issue #257)
+
+The following invariants are enforced by the contract and verified by tests in `src/test_namespaces.rs`:
+
+| Invariant | Enforcement point |
+|---|---|
+| Blacklist check is unconditional and evaluated before whitelist | `claim()` in `src/lib.rs` |
+| Whitelist membership cannot bypass blacklist | Eligibility logic: `if blacklisted → false` |
+| `blacklist_add` is idempotent (duplicate add is a no-op) | `blacklist_add()` checks `was_present` before inserting |
+| `blacklist_remove` is idempotent (remove of absent address is safe) | `blacklist_remove()` calls `map.remove()` which is a no-op if absent |
+| Blacklist/whitelist are scoped per `(issuer, namespace, token)` | `DataKey::Blacklist(OfferingId)` / `DataKey::Whitelist(OfferingId)` |
+| Only issuer or admin may modify blacklist | Auth guard in `blacklist_add()` and `blacklist_remove()` |
+
+### Eligibility Algorithm
+
+```
+if is_blacklisted(addr)                            → INELIGIBLE
+else if whitelist_enabled && !is_whitelisted(addr) → INELIGIBLE
+else                                               → ELIGIBLE
+```
+
 ## Identified Issues
 
 - No outstanding auth vulnerabilities identified in blacklist operations; they now require issuer or admin.
